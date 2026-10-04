@@ -1,0 +1,118 @@
+# Builds Hamyar for phones every time you upload a new hamyar-source.zip:
+#   • Android: a signed APK, attached to the newest GitHub Release
+#   • iPhone (and any phone browser): the installable web app on GitHub Pages
+# Setup steps are in the Persian guide that came with this file.
+name: Build Hamyar for phones
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: hamyar-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Unpack the source
+        run: |
+          ZIP=hamyar-source.zip
+          if [ ! -f "$ZIP" ]; then ZIP="$(ls -1 ./*.zip 2>/dev/null | head -n 1)"; fi
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "::error title=hamyar-source.zip is missing::Upload hamyar-source.zip to this repository (Add file → Upload files), then run this workflow again."
+            exit 1
+          fi
+          echo "Using $ZIP"
+          unzip -q "$ZIP" -d unpacked
+          SRC="$(dirname "$(find unpacked -maxdepth 3 -name package.json -not -path '*/node_modules/*' | head -n 1)")"
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          echo "Source folder: $SRC"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install and run the tests
+        working-directory: ${{ env.SRC }}
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+      - name: Build the phone web app
+        working-directory: ${{ env.SRC }}
+        run: npm run build:mobile
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ env.SRC }}/dist-mobile
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Prepare the Android project
+        working-directory: ${{ env.SRC }}
+        run: npx cap sync android
+
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.HAMYAR_KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.HAMYAR_KEYSTORE_PASSWORD }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/hamyar.jks"
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
+            echo "$KEYSTORE_B64" | tr -d ' \r\n' | base64 -d > "$KEYSTORE"
+            PASS="$KEYSTORE_PASSWORD"
+          else
+            echo "::warning title=Temporary signing key::The HAMYAR_KEYSTORE secrets are not set, so this APK uses a one-time key. It installs fine, but a later APK will not install over it (export your data, uninstall, then install)."
+            PASS="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$KEYSTORE" -storetype PKCS12 -alias hamyar -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=Hamyar"
+          fi
+          echo "::add-mask::$PASS"
+          {
+            echo "HAMYAR_KEYSTORE_FILE=$KEYSTORE"
+            echo "HAMYAR_KEYSTORE_PASSWORD=$PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the Android app
+        working-directory: ${{ env.SRC }}/android
+        env:
+          HAMYAR_VERSION_CODE: ${{ github.run_number }}
+          HAMYAR_VERSION_NAME: 0.2.${{ github.run_number }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/hamyar.apk"
+
+      - name: Publish the APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" hamyar.apk \
+            --title "Hamyar ${{ github.run_number }}" \
+            --notes "Android: download hamyar.apk on the phone and install it. iPhone: open https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ in Safari and choose Add to Home Screen." \
+            --latest
+
+  pages:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish the web app
+        id: deployment
+        uses: actions/deploy-pages@v5
